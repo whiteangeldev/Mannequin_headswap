@@ -58,6 +58,8 @@ class Process:
     def preprocess(self,x,size=512):
         if isinstance(x,str):
             x = cv2.imread(x)
+        if x is None or x.size == 0:
+            raise ValueError("preprocess received an empty or invalid image")
         x = cv2.resize(x,[size,size])
         x = (x[...,::-1].transpose(2,0,1)[np.newaxis,:] / 255 - 0.5) * 2
       

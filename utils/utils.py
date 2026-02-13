@@ -285,9 +285,9 @@ def _image_stats(image, center_ratio, mask):
     else:
         (light, col_a, col_b) = cv2.split(image)
         mask = mask[:,:,0]
-        light = np.masked_array(light, mask=mask<=240)  #位置： 1 无效， 0 有效
-        col_a = np.masked_array(col_a, mask=mask<=240)  
-        col_b = np.masked_array(col_b, mask=mask<=240)  
+        light = np.ma.masked_array(light, mask=mask<=240)  #位置： 1 无效， 0 有效
+        col_a = np.ma.masked_array(col_a, mask=mask<=240)
+        col_b = np.ma.masked_array(col_b, mask=mask<=240)  
             
     (l_mean, l_std) = (light.mean(), light.std())
     (a_mean, a_std) = (col_a.mean(), col_a.std())
