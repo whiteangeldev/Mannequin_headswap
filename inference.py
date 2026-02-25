@@ -41,6 +41,123 @@ class Infer(Process):
         # Optional super-resolution (ONNX)
         self.ort_session_sr = ort.InferenceSession('./pretrained_models/sr_cf.onnx', providers=['CPUExecutionProvider'])
 
+    def _gauss_pyr(self, img, levels):
+        """Gaussian pyramid: list of downsampled images."""
+        G = [img.astype(np.float32)]
+        for _ in range(levels):
+            G.append(cv2.pyrDown(G[-1]))
+        return G
+
+    def _lap_pyr(self, G):
+        """Laplacian pyramid from Gaussian pyramid."""
+        L = []
+        for i in range(len(G) - 1):
+            GE = cv2.pyrUp(G[i + 1], dstsize=(G[i].shape[1], G[i].shape[0]))
+            L.append(G[i] - GE)
+        L.append(G[-1].copy())
+        return L
+
+    def _reconstruct_from_lap(self, L):
+        """Reconstruct image from Laplacian pyramid."""
+        img = L[-1].copy()
+        for i in range(len(L) - 2, -1, -1):
+            img = cv2.pyrUp(img, dstsize=(L[i].shape[1], L[i].shape[0])) + L[i]
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+    def _multiband_blend(self, src, dst, mask, levels=6, mask_sigma=15):
+        """
+        Multiband (Laplacian pyramid) blend for seamless composite.
+        src: face region (e.g. warped source), dst: base (e.g. gen), mask: 0..255 single channel.
+        """
+        src = np.clip(src, 0, 255).astype(np.float32)
+        dst = np.clip(dst, 0, 255).astype(np.float32)
+        m = (np.clip(mask, 0, 255).astype(np.float32) / 255.0)
+        if m.ndim == 2:
+            m3 = np.stack([m, m, m], axis=-1)
+        else:
+            m3 = m
+        m3 = cv2.GaussianBlur(m3, (0, 0), mask_sigma)
+        m3 = np.clip(m3, 0.0, 1.0)
+
+        Gs = self._gauss_pyr(src, levels)
+        Gd = self._gauss_pyr(dst, levels)
+        Gm = self._gauss_pyr(m3, levels)
+        Ls = self._lap_pyr(Gs)
+        Ld = self._lap_pyr(Gd)
+
+        LS = []
+        for ls, ld, gm in zip(Ls, Ld, Gm):
+            gm = gm if gm.ndim == 3 else np.stack([gm, gm, gm], axis=-1)
+            LS.append(ls * gm + ld * (1.0 - gm))
+        return self._reconstruct_from_lap(LS)
+
+    def _ring_tone_equalize(self, img_bgr, face_mask, skin_region=None):
+        """Match inside/outside tone in a narrow ellipse boundary band."""
+        img = img_bgr.astype(np.uint8)
+        m = np.clip(face_mask.astype(np.float32), 0.0, 1.0)
+        if skin_region is None:
+            skin = np.ones_like(m, dtype=np.uint8)
+        else:
+            skin = (skin_region > 0).astype(np.uint8)
+
+        inside_ring = ((m > 0.56) & (m < 0.80) & (skin > 0))
+        outside_ring = ((m > 0.20) & (m < 0.44) & (skin > 0))
+        band = ((m > 0.20) & (m < 0.80) & (skin > 0)).astype(np.float32)
+        if int(np.count_nonzero(inside_ring)) < 100 or int(np.count_nonzero(outside_ring)) < 100:
+            return img
+
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        l, a, b = cv2.split(lab)
+        k = max((int(0.06 * min(img.shape[:2])) | 1), 17)
+        l_low = cv2.GaussianBlur(l, (k, k), 0)
+        a_low = cv2.GaussianBlur(a, (k, k), 0)
+        b_low = cv2.GaussianBlur(b, (k, k), 0)
+        l_hi = l - l_low
+        a_hi = a - a_low
+        b_hi = b - b_low
+
+        def _med(arr, idx):
+            return float(np.median(arr[idx]))
+
+        dl = np.clip(_med(l_low, outside_ring) - _med(l_low, inside_ring), -10.0, 10.0)
+        da = np.clip(_med(a_low, outside_ring) - _med(a_low, inside_ring), -7.0, 7.0)
+        db = np.clip(_med(b_low, outside_ring) - _med(b_low, inside_ring), -7.0, 7.0)
+
+        w = cv2.GaussianBlur(band, (k, k), 0)
+        w = np.clip(w * np.clip((m - 0.45) / 0.35, 0.0, 1.0), 0.0, 1.0)
+        l_new = l_low + dl * w + l_hi
+        a_new = a_low + da * w + a_hi
+        b_new = b_low + db * w + b_hi
+        out = cv2.merge([
+            np.clip(l_new, 0, 255).astype(np.float32),
+            np.clip(a_new, 0, 255).astype(np.float32),
+            np.clip(b_new, 0, 255).astype(np.float32),
+        ])
+        return cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+    def _ring_border_blur(self, img_bgr, face_mask):
+        """Strong blur on ellipse boundary band to hide contour line (essential for natural look)."""
+        img = img_bgr.astype(np.float32)
+        m = np.clip(face_mask.astype(np.float32), 0.0, 1.0)
+        h, w = img.shape[:2]
+        # Wider ring: full transition band so blur covers the visible seam
+        band_half = 0.28
+        ring = np.clip(1.0 - np.abs(m - 0.5) / band_half, 0.0, 1.0)
+        ring *= ((m > 0.08) & (m < 0.92)).astype(np.float32)
+        if int(np.count_nonzero(ring > 0.05)) < 80:
+            return img_bgr.astype(np.uint8), ring
+
+        # Strong blur: large kernel so border line is dissolved
+        k1 = max((int(0.10 * min(h, w)) | 1), 35)
+        k2 = max((int(0.06 * min(h, w)) | 1), 21)
+        blur = cv2.GaussianBlur(img, (k1, k1), 0)
+        blur = cv2.GaussianBlur(blur, (k2, k2), 0)
+        ring_soft = cv2.GaussianBlur(ring, (k2, k2), 0)
+        # High blend weight so blurred version dominates on border (hide line)
+        w = np.clip(ring_soft * 1.0, 0.0, 0.95)[:, :, np.newaxis]
+        out = np.clip(img * (1.0 - w) + blur * w, 0, 255).astype(np.uint8)
+        return out, w[:, :, 0]
+
     def _duplicate_source_identity(self, gen, src_align, src_lmk, tgt_lmk, alpha=0.95, debug_dir=None, step_name="05"):
         """Warp source face to target layout and blend onto gen (main identity step)."""
         H, W = gen.shape[:2]
@@ -84,73 +201,61 @@ class Infer(Process):
             self._debug_save(debug_dir, f"{step_name}_a_warped_source.png", warped_src.astype(np.uint8))
             self._debug_log(f"  5.2. Source face warped to target geometry")
 
-        # Clone mask: create minimal partial face mask (core features only) to avoid boundary/ear issues.
-        # Use only inner face landmarks and restrict width to exclude ear regions.
+        # Clone mask: create ellipse-shaped partial face mask (core features only) to avoid boundary/ear issues.
         if tgt_pts.shape[0] >= 68:
             center_x = float((tgt_pts[36, 0] + tgt_pts[45, 0]) * 0.5)
+            center_y = float((tgt_pts[36, 1] + tgt_pts[45, 1]) * 0.5)
             face_w = max(float(np.linalg.norm(tgt_pts[16] - tgt_pts[0])), 1.0)
             face_h = max(float(np.linalg.norm(tgt_pts[8] - ((tgt_pts[19] + tgt_pts[24]) * 0.5))), 1.0)
             
-            # Create minimal mask using only inner face landmarks (exclude outer contour)
-            # Use: eyebrows, eyes, nose, mouth - exclude jaw contour points that extend to ears
-            inner_face_pts = np.concatenate([
-                tgt_pts[17:27],  # Eyebrows
-                tgt_pts[36:48],  # Eyes
-                tgt_pts[27:36],  # Nose
-                tgt_pts[48:68],  # Mouth and inner jaw
-            ])
-            
-            # Create convex hull from inner points only
-            inner_hull = cv2.convexHull(np.round(inner_face_pts).astype(np.int32))
-            face_mask = np.zeros((H, W), dtype=np.float32)
-            cv2.fillConvexPoly(face_mask, inner_hull, 1.0)
-            
-            # Restrict width: allow more expansion at top/bottom, less at sides (to exclude ears)
-            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            # Calculate ellipse parameters based on face landmarks
             brow_y = float(np.min(tgt_pts[17:27, 1]))
             chin_y = float(np.max(tgt_pts[6:12, 1]))
-            mid_y = float((brow_y + chin_y) * 0.5)
             
-            # Wider at top (forehead) and bottom (chin): 50% of face width
-            # Narrower at middle (cheeks): 42% of face width (where ears are)
-            top_bottom_width = 0.50 * face_w
-            middle_width = 0.42 * face_w
+            # Ellipse center: move down a little bit from eye center
+            # Shift center_y down by ~8% of face height
+            center_y_offset = face_h * 0.08
+            center_y_adjusted = center_y + center_y_offset
+            ellipse_center = (int(center_x), int(center_y_adjusted))
             
-            # Create adaptive width limit based on vertical position
-            y_dist_from_mid = np.abs(yy - mid_y)
-            y_range = max(chin_y - brow_y, 1.0)
+            # Ellipse axes: wider at top/bottom, narrower in middle (to exclude ears)
+            # Much wider widths for bigger, fatter ellipse: Top/bottom width: 75% of face width, middle width: 65% of face width
+            top_bottom_width = 0.8 * face_w
+            middle_width = 0.7 * face_w
+            
+            # Ellipse height: from eyebrows to chin, with significant expansion
+            ellipse_height = max(chin_y - brow_y, face_h * 0.8) * 1.20  # 30% taller
+            
+            # Create ellipse mask with adaptive width
+            face_mask = np.zeros((H, W), dtype=np.float32)
+            yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+            
+            # Calculate distance from adjusted ellipse center
+            dx = (xx - center_x) / (top_bottom_width / 2.0)
+            dy = (yy - center_y_adjusted) / (ellipse_height / 2.0)
+            
+            # Adaptive width: wider at top/bottom, narrower in middle
+            y_dist_from_center = np.abs(yy - center_y_adjusted)
+            y_range = ellipse_height / 2.0
+            width_factor = np.clip(1.0 - (y_dist_from_center / y_range), 0.0, 1.0)
             # Interpolate between top/bottom width and middle width
-            width_factor = np.clip(1.0 - (y_dist_from_mid / (0.5 * y_range)), 0.0, 1.0)
-            width_limit = middle_width + (top_bottom_width - middle_width) * width_factor
+            adaptive_width = middle_width + (top_bottom_width - middle_width) * width_factor
             
-            side_exclusion = np.abs(xx - center_x) > width_limit
-            face_mask[side_exclusion] = 0.0
+            # Create ellipse with adaptive width
+            dx_adaptive = (xx - center_x) / (adaptive_width / 2.0)
+            ellipse_mask = (dx_adaptive * dx_adaptive + dy * dy) <= 1.0
+            face_mask[ellipse_mask] = 1.0
             
-            # Slight dilation to expand mask a bit more (but still conservative)
-            face_mask_u8 = (face_mask > 0.5).astype(np.uint8)
-            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-            face_mask_u8 = cv2.dilate(face_mask_u8, kernel_dilate, iterations=1)
-            # Then slight erosion to smooth
-            kernel_erode = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            face_mask_u8 = cv2.erode(face_mask_u8, kernel_erode, iterations=1)
-            face_mask = face_mask_u8.astype(np.float32)
-            
-            # Keep only largest connected component
-            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(face_mask_u8, connectivity=8)
-            if num_labels > 1:
-                largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-                face_mask = (labels == largest).astype(np.float32)
+            # Smooth the ellipse edges
+            face_mask = cv2.GaussianBlur(face_mask, (11, 11), 0)
+            face_mask = np.clip(face_mask, 0, 1.0)
             
             face_mask_base = face_mask.copy()
-            
-            # Smooth edges
-            face_mask = cv2.GaussianBlur(face_mask, (9, 9), 0)
-            face_mask = np.clip(face_mask, 0, 1.0)
             
             if debug_dir:
                 self._debug_save(debug_dir, f"{step_name}_b_mask_base.png", face_mask_base, is_mask=True)
                 self._debug_save(debug_dir, f"{step_name}_b_mask_blurred.png", face_mask, is_mask=True)
-                self._debug_log(f"  5.3. Partial face mask created (inner landmarks, expanded, top/bottom: {top_bottom_width:.1f}px, middle: {middle_width:.1f}px from center)")
+                self._debug_log(f"  5.3. Ellipse-shaped partial face mask created (top/bottom: {top_bottom_width:.1f}px, middle: {middle_width:.1f}px, height: {ellipse_height:.1f}px)")
         else:
             # Fallback: simple convex hull
             hull = cv2.convexHull(np.round(tgt_pts).astype(np.int32))
@@ -207,18 +312,9 @@ class Infer(Process):
             if debug_dir:
                 self._debug_log(f"  5.5. Forehead blending skipped (invalid region)")
 
-        # Color transfer: match warped source skin tone to generated face skin tone
-        # This ensures the partial mask part matches the rest of the face
-        face_mask_uint8 = (face_mask * 255).astype(np.uint8)
-        # Ensure mask is 3D (H, W, 1) for color_transfer2
-        if face_mask_uint8.ndim == 2:
-            face_mask_uint8 = face_mask_uint8[:, :, np.newaxis]
-        warped_src_color_matched = color_transfer2(gen_f, warped_src, center_ratio=0.7, mask=face_mask_uint8)
-        warped_src = warped_src_color_matched.astype(np.float32)
-        
+        # Keep source face details clear: skip additional color remap here.
         if debug_dir:
-            self._debug_save(debug_dir, f"{step_name}_e_color_matched.png", warped_src.astype(np.uint8))
-            self._debug_log(f"  5.5.5. Color transfer applied: source face matched to target skin tone")
+            self._debug_log("  5.5.5. Color transfer skipped (clarity-preserving mode)")
 
         blend = np.clip(face_mask * alpha, 0.0, 1.0)[:, :, np.newaxis]
 
@@ -226,13 +322,161 @@ class Infer(Process):
             self._debug_save(debug_dir, f"{step_name}_e_final_blend_mask.png", blend[:, :, 0], is_mask=True)
             self._debug_log(f"  5.6. Final blend mask created (alpha={alpha}, mask strength: min={blend.min():.3f}, max={blend.max():.3f}, mean={blend.mean():.3f})")
 
-        out = warped_src * blend + gen_f * (1.0 - blend)
-        result = np.clip(out, 0, 255).astype(np.uint8)
-        
+        # Multiband (Laplacian pyramid) composite for seamless ellipse boundary.
+        mask_u8 = (np.clip(blend[:, :, 0], 0.0, 1.0) * 255.0).astype(np.uint8)
+        mask_sigma = max(15, int(0.03 * min(H, W)))
+        result = self._multiband_blend(
+            np.clip(warped_src, 0, 255).astype(np.uint8),
+            np.clip(gen_f, 0, 255).astype(np.uint8),
+            mask_u8,
+            levels=6,
+            mask_sigma=mask_sigma,
+        )
+
         if debug_dir:
             self._debug_save(debug_dir, f"{step_name}_f_before_blend.png", gen_f.astype(np.uint8))
             self._debug_save(debug_dir, f"{step_name}_f_after_blend.png", result)
-            self._debug_log(f"  5.7. Final blending complete: {alpha*100:.0f}% warped source + {(1-alpha)*100:.0f}% generated")
+            self._debug_log(f"  5.7. Multiband blend complete (levels=6, mask_sigma={mask_sigma})")
+
+        # 5.8 One-skin harmonization:
+        # Use inside-ellipse core skin as reference, then smoothly propagate it over full
+        # face+neck skin (with boundary emphasis) to remove ellipse-region differences.
+        try:
+            h_res, w_res = result.shape[:2]
+            res_t = self.preprocess(result, size=512)
+            with torch.no_grad():
+                parsing_out = self.parsing(self.preprocess_parsing(res_t))
+            parsing_map = self.postprocess_parsing(parsing_out)[0, 0].cpu().numpy().astype(np.uint8)
+            if parsing_map.shape != (h_res, w_res):
+                parsing_map = cv2.resize(parsing_map, (w_res, h_res), interpolation=cv2.INTER_NEAREST)
+
+            # Parsing skin/neck.
+            skin_parse = ((parsing_map == 1) | (parsing_map == 14) | (parsing_map == 15)).astype(np.uint8)
+            skin_parse = cv2.morphologyEx(
+                skin_parse, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)), iterations=1
+            )
+            skin_parse = cv2.dilate(
+                skin_parse, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1
+            )
+
+            # Geometry face+neck support to avoid parsing holes.
+            geom_region = np.zeros((h_res, w_res), dtype=np.uint8)
+            hull = cv2.convexHull(np.round(tgt_pts[:27]).astype(np.int32))
+            cv2.fillConvexPoly(geom_region, hull, 1)
+            chin_y = float(np.max(tgt_pts[6:12, 1]))
+            neck_bottom = int(np.clip(chin_y + face_h * 0.62, 0, h_res - 1))
+            jaw_x0 = int(np.clip(np.min(tgt_pts[4:13, 0]) - 0.10 * face_w, 0, w_res - 1))
+            jaw_x1 = int(np.clip(np.max(tgt_pts[4:13, 0]) + 0.10 * face_w, 0, w_res - 1))
+            chin_top = int(np.clip(chin_y, 0, h_res - 1))
+            if neck_bottom > chin_top and jaw_x1 > jaw_x0:
+                cv2.rectangle(geom_region, (jaw_x0, chin_top), (jaw_x1, neck_bottom), 1, -1)
+            geom_region = cv2.GaussianBlur(geom_region.astype(np.float32), (19, 19), 0)
+            geom_region = (geom_region > 0.25).astype(np.uint8)
+
+            target_region = ((skin_parse > 0) | (geom_region > 0)).astype(np.uint8)
+            target_region = cv2.morphologyEx(
+                target_region, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1
+            )
+
+            inside = (face_mask > 0.50).astype(np.uint8)
+            outside = (1 - inside).astype(np.uint8)
+            core_ref = ((face_mask > 0.68).astype(np.uint8) & (target_region > 0)).astype(np.uint8)
+            rest_skin = ((target_region > 0) & (core_ref == 0)).astype(np.uint8)
+
+            if int(np.count_nonzero(core_ref)) > 180 and int(np.count_nonzero(rest_skin)) > 260:
+                dist_in = cv2.distanceTransform(inside, cv2.DIST_L2, 5).astype(np.float32)
+                dist_out = cv2.distanceTransform(outside, cv2.DIST_L2, 5).astype(np.float32)
+                signed_d = dist_in - dist_out
+
+                # Build smooth correction field over target skin:
+                # - stronger outside ellipse,
+                # - gentle inside support,
+                # - explicit boost near boundary to hide contour.
+                outside_w = np.clip((1.0 - face_mask) * target_region.astype(np.float32), 0.0, 1.0)
+                inside_w = np.clip((face_mask - 0.25) / 0.75, 0.0, 1.0) * target_region.astype(np.float32) * 0.35
+                seam_sigma = max(10.0, 0.07 * min(face_w, face_h))
+                seam_w = np.exp(-np.abs(signed_d) / seam_sigma) * target_region.astype(np.float32)
+                corr_w = np.clip(0.78 * outside_w + 0.22 * inside_w + 0.55 * seam_w, 0.0, 1.0).astype(np.float32)
+                corr_w = cv2.GaussianBlur(corr_w, (41, 41), 0)
+                corr_w = np.clip(corr_w, 0.0, 1.0)
+
+                lab = cv2.cvtColor(result, cv2.COLOR_BGR2LAB).astype(np.float32)
+                l_ch, a_ch, b_ch = cv2.split(lab)
+                k = max((int(min(h_res, w_res) * 0.12) | 1), 25)
+                l_low = cv2.GaussianBlur(l_ch, (k, k), 0)
+                a_low = cv2.GaussianBlur(a_ch, (k, k), 0)
+                b_low = cv2.GaussianBlur(b_ch, (k, k), 0)
+                l_high = l_ch - l_low
+                a_high = a_ch - a_low
+                b_high = b_ch - b_low
+
+                def _mask_stats(arr, idx):
+                    vals = arr[idx]
+                    return float(np.median(vals)), float(np.std(vals))
+
+                l_ref_m, l_ref_s = _mask_stats(l_low, core_ref > 0)
+                a_ref_m, a_ref_s = _mask_stats(a_low, core_ref > 0)
+                b_ref_m, b_ref_s = _mask_stats(b_low, core_ref > 0)
+                l_rest_m, l_rest_s = _mask_stats(l_low, rest_skin > 0)
+                a_rest_m, a_rest_s = _mask_stats(a_low, rest_skin > 0)
+                b_rest_m, b_rest_s = _mask_stats(b_low, rest_skin > 0)
+
+                l_scale = np.clip(l_ref_s / max(l_rest_s, 1e-6), 0.88, 1.14)
+                a_scale = np.clip(a_ref_s / max(a_rest_s, 1e-6), 0.90, 1.12)
+                b_scale = np.clip(b_ref_s / max(b_rest_s, 1e-6), 0.90, 1.12)
+
+                l_target = (l_low - l_rest_m) * l_scale + l_rest_m + np.clip(l_ref_m - l_rest_m, -10.0, 10.0)
+                a_target = (a_low - a_rest_m) * a_scale + a_rest_m + np.clip(a_ref_m - a_rest_m, -8.0, 8.0)
+                b_target = (b_low - b_rest_m) * b_scale + b_rest_m + np.clip(b_ref_m - b_rest_m, -8.0, 8.0)
+
+                strength = 0.95
+                l_low_adj = l_low + (l_target - l_low) * corr_w * strength
+                a_low_adj = a_low + (a_target - a_low) * corr_w * strength
+                b_low_adj = b_low + (b_target - b_low) * corr_w * strength
+
+                l_new = l_low_adj + l_high
+                a_new = a_low_adj + a_high
+                b_new = b_low_adj + b_high
+
+                skin_soft = cv2.GaussianBlur(target_region.astype(np.float32), (35, 35), 0)
+                skin_soft = np.clip(skin_soft, 0.0, 1.0)
+                l_final = l_ch * (1.0 - skin_soft) + l_new * skin_soft
+                a_final = a_ch * (1.0 - skin_soft) + a_new * skin_soft
+                b_final = b_ch * (1.0 - skin_soft) + b_new * skin_soft
+
+                lab_out = cv2.merge([
+                    np.clip(l_final, 0, 255).astype(np.float32),
+                    np.clip(a_final, 0, 255).astype(np.float32),
+                    np.clip(b_final, 0, 255).astype(np.float32),
+                ])
+                result = cv2.cvtColor(lab_out.astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+                # 5.8.1 Equalize ring tone (inside/outside ellipse skin).
+                result = self._ring_tone_equalize(result, face_mask, target_region)
+
+                if debug_dir:
+                    self._debug_save(debug_dir, f"{step_name}_g_skin_parse.png", skin_parse.astype(np.float32), is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_geom_region.png", geom_region.astype(np.float32), is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_target_region.png", target_region.astype(np.float32), is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_core_ref.png", core_ref.astype(np.float32), is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_rest_skin.png", rest_skin.astype(np.float32), is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_corr_weight.png", corr_w, is_mask=True)
+                    self._debug_save(debug_dir, f"{step_name}_g_unified_skin.png", result)
+                    self._debug_log(
+                        f"  5.8. One-skin harmonization applied (strength={strength:.2f})"
+                    )
+            elif debug_dir:
+                self._debug_log("  5.8. One-skin harmonization skipped (insufficient reference/rest pixels)")
+        except Exception as e:
+            if debug_dir:
+                self._debug_log(f"  5.8. One-skin harmonization skipped: {e}")
+
+        # Always apply strong ellipse-border blur to hide contour (essential).
+        result, ring_blur_w = self._ring_border_blur(result, face_mask)
+        if debug_dir:
+            self._debug_save(debug_dir, f"{step_name}_g_ring_blur_weight.png", ring_blur_w, is_mask=True)
+            self._debug_save(debug_dir, f"{step_name}_final_border_blur.png", result)
+            self._debug_log("  5.9. Strong border blur applied (ellipse contour hidden)")
         
         return result
 
@@ -477,5 +721,5 @@ if __name__ == "__main__":
         'pretrained_models/BFM'
     )
     src_paths = ['./assets/human.jpg']
-    tgt_paths = ['assets/model.jpg']
+    tgt_paths = ['assets/model1.jpg']
     model.run(src_paths, tgt_paths, save_base='res-1125', crop_align=True, cat=False, debug_dir='res-1125/debug')
